@@ -42,6 +42,7 @@ from lmcache.v1.memory_management import (  # noqa: E501
     MixedMemoryAllocator,
     PagedTensorMemoryAllocator,
     TensorMemoryObj,
+    BytesBufferMemoryObj,
 )
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 from lmcache.v1.system_detection import NUMADetector, NUMAMapping
@@ -336,13 +337,18 @@ class LMCacheEngine:
         # memory_objs might be empty, directly return to avoid sending tokens
         if not memory_objs:
             return
+
+        # 目前对于压缩卸载的实现，仍然是先从 GPU 拷贝到 CPU，再考虑压缩(还会回到 GPU 上执行量化压缩，效率很低)
+        # TODO(wk): 对于需要压缩保存的 block，直接在 GPU 端压缩后卸载存储到 CPU，避免多一次拷贝
         self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
         offload_time += time.perf_counter() - t
 
         t = time.perf_counter()
 
         transfer_spec = kwargs.get("transfer_spec", None)
-        self.storage_manager.batched_put(keys, memory_objs, transfer_spec=transfer_spec)
+        compress = kwargs.get("compress", False)
+
+        self.storage_manager.batched_put(keys, memory_objs, transfer_spec=transfer_spec, compress=compress)
         put_time += time.perf_counter() - t
 
         tot_time = offload_time + put_time
@@ -1308,6 +1314,20 @@ class LMCacheEngine:
                     ):
                         last_failed_block_start = start
                     break
+
+                # TODO(wk): 在上层 or 更底层进行解压？
+                # if isinstance(memory_obj, BytesBufferMemoryObj):
+                #     if not hasattr(self, "_deserializer"):
+                #         # First Party
+                #         from lmcache.v1.storage_backend.naive_serde import CreateSerde
+
+                #         # TODO(Jiayi): Support other compression methods
+                #         _, self._deserializer = CreateSerde(
+                #             "cachegen", self.metadata, self.config
+                #         )
+                #     memory_obj = self._deserializer.deserialize(memory_obj)
+
+
                 reordered_chunks.append((key, memory_obj, start, end))
                 tot_kv_size += memory_obj.get_size()
                 ret_mask[start:end] = True

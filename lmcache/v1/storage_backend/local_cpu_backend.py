@@ -28,6 +28,9 @@ from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterfac
 from lmcache.v1.storage_backend.batched_message_sender import BatchedMessageSender
 from lmcache.v1.storage_backend.cache_policy import get_cache_policy
 from lmcache.v1.system_detection import NUMADetector, SystemMemoryDetector
+from lmcache.v1.storage_backend.naive_serde.cachegen_encoder import CacheGenSerializer
+from lmcache.v1.storage_backend.naive_serde.cachegen_decoder import CacheGenDeserializer
+from lmcache.v1.memory_management import BytesBufferMemoryObj
 
 if TYPE_CHECKING:
     # First Party
@@ -55,6 +58,12 @@ class LocalCPUBackend(AllocatorBackendInterface):
             super().__init__(dst_device)
         else:
             super().__init__("cpu")
+
+        self.serializer = None
+        self.deserializer = None
+        if metadata:
+             self.serializer = CacheGenSerializer(config, metadata)
+             self.deserializer = CacheGenDeserializer(config, metadata)
 
         self.cache_policy = get_cache_policy(config.cache_policy)
         self.hot_cache = self.cache_policy.init_mutable_mapping()
@@ -170,6 +179,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         keys: Sequence[CacheEngineKey],
         memory_objs: List[MemoryObj],
         transfer_spec: Any = None,
+        compress: bool = False,
     ) -> None:
         """
         Synchronously put the MemoryObjs into the local cpu backend.
@@ -177,8 +187,20 @@ class LocalCPUBackend(AllocatorBackendInterface):
         if not self.use_hot:
             return
 
-        # TODO(Jiayi): optimize this with batching
         for key, memory_obj in zip(keys, memory_objs, strict=False):
+            # TODO(wk): 是否需要 update_on_hit？
+            # if self.contains(key):
+            #     self.cache_policy.update_on_hit(key, self.hot_cache)
+            #     continue
+            
+            # TODO(wk): 暂时不会走入该分支，即不会进行压缩存储
+            if compress:
+                # Compress
+                if self.serializer:
+                    compressed_obj = self.serializer.serialize(memory_obj)
+                    self.submit_put_task(key, compressed_obj)
+                    return
+
             self.submit_put_task(key, memory_obj)
 
     def get_blocking(
@@ -189,6 +211,24 @@ class LocalCPUBackend(AllocatorBackendInterface):
             if key not in self.hot_cache:
                 return None
             memory_obj = self.hot_cache[key]
+            
+            # TODO(wk): 暂时不会走入该分支，即不会进行压缩存储
+            if isinstance(memory_obj, BytesBufferMemoryObj) and self.deserializer:
+                decompressed_obj = self.deserializer.deserialize(memory_obj)
+                # 注意: 返回 gpu memory_obj
+                memory_obj = decompressed_obj
+
+                # 解压存储到 CPU 上
+                # TODO(wk): 存在问题，并没有分配 pinned memory，可能影响性能
+                # if decompressed_obj.tensor.is_cuda:
+                #     cpu_tensor = decompressed_obj.tensor.cpu()
+                #     cpu_obj = TensorMemoryObj(decompressed_obj.metadata)
+                #     cpu_obj.tensor = cpu_tensor
+                     
+                #     self.hot_cache[key] = cpu_obj
+            # TODO(wk): 是否需要 update_on_hit？
+            # self.cache_policy.update_on_hit(key, self.hot_cache)
+
             # ref count up for caller to avoid situation where the memory_obj
             # is evicted from the local cpu backend before the caller calls
             # ref count up themselves

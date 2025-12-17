@@ -100,6 +100,8 @@ class SaveSpec:
     skip_leading_tokens: int
     # Whether the scheduler allow us to save the tokens
     can_save: bool
+    # Gate score
+    compress: bool = False
 
 
 @dataclass
@@ -1232,6 +1234,7 @@ class LMCacheConnectorV1Impl:
     def wait_for_save(self):
         """Blocking until the KV cache is saved to the connector buffer."""
 
+        # 此处获取最新的 metadata, 是否 compress 会更新
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
 
@@ -1313,6 +1316,12 @@ class LMCacheConnectorV1Impl:
                     store_mask = store_mask[:aligned_token_len]
                     slot_mapping = slot_mapping[:aligned_token_len]
 
+            # for debug
+            # if request.save_spec.compress:
+            #     logger.warning(
+            #         f"Request {request.req_id} is saving with compression."
+            #     )
+
             self.lmcache_engine.store(
                 token_ids,
                 mask=store_mask,
@@ -1321,6 +1330,7 @@ class LMCacheConnectorV1Impl:
                 offset=skip_leading_tokens,
                 transfer_spec=request.disagg_spec,
                 request_configs=request.request_configs,
+                compress=request.save_spec.compress,
             )
 
             # Update skip_leading_tokens only on last rank to ensure
@@ -1603,6 +1613,9 @@ class LMCacheConnectorV1Impl:
 
         self.load_specs[request.request_id].can_load = True
 
+
+    # TODO(wk): 进一步确认此处，对于 probe_req 的 kv cache block会不会进行 save(我们希望不进行 save)
+    # 这一块是与上面两步(match + update state)联动的(对于 probe_req, 我们均未进行上面两步处理)
     @_lmcache_nvtx_annotate
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -1634,6 +1647,11 @@ class LMCacheConnectorV1Impl:
             # Ignore DP attention mock requests
             if request.req_id.startswith("mock_req"):
                 continue
+
+            # ignore prob_reqs
+            if request.req_id.startswith("probe_"):
+                continue
+
             load_spec = self.load_specs.pop(request.req_id, None)
             num_tokens_to_compute = (
                 request.num_computed_tokens

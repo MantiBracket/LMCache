@@ -359,6 +359,7 @@ class StorageManager:
         memory_objs: List[MemoryObj],
         transfer_spec=None,
         location: Optional[str] = None,
+        compress: bool = False,   # no use for now
     ) -> None:
         """
         Non-blocking function to batched put the memory objects into the
