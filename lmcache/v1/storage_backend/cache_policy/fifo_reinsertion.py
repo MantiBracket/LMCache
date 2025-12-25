@@ -51,55 +51,52 @@ class FIFOReinsertionCachePolicy(BaseCachePolicy[KeyType, OrderedDict[KeyType, A
         cache_dict: OrderedDict[KeyType, Any],
         num_candidates: int = 1,
     ) -> list[KeyType]:
-        evict_keys = []
-        
-        # Safety limit to prevent infinite loops if all items are pinned
-        # or if we somehow get stuck.
-        # In a worst case, we might cycle through the whole list multiple times.
-        # But counts decrease, so we should terminate unless everything is pinned.
+        evict_keys: list[KeyType] = []
+
+        # Safety limit to prevent infinite loops if all items are pinned.
+        # In the worst case we may need to "cycle" through evictable entries
+        # multiple times until their access counts are decremented to 0.
         max_iterations = len(cache_dict) * (self.max_access_count + 2)
         iterations = 0
 
-        while len(evict_keys) < num_candidates and len(cache_dict) > 0:
+        while len(evict_keys) < num_candidates and cache_dict:
             if iterations > max_iterations:
-                logger.warning("Max iterations reached in get_evict_candidates. Stopping search.")
-                break
-            
-            # Peek at the head of the queue
-            try:
-                key = next(iter(cache_dict))
-            except StopIteration:
+                logger.warning(
+                    "Max iterations reached in get_evict_candidates. Stopping search."
+                )
                 break
 
-            cache_val = cache_dict[key]
-
-            # If the item is already selected for eviction (in this call), skip it?
-            # But we move selected items to the end to proceed.
-            # So if we see it again, it means we cycled through everything?
-            if key in evict_keys:
-                # We wrapped around and found our own candidates.
-                # This implies we can't find more candidates.
+            # Find the oldest *evictable* entry (pinned entries are skipped but not
+            # reordered; FIFO order among pinned entries is preserved).
+            selected_key: KeyType | None = None
+            for key in list(cache_dict.keys()):
+                if key in evict_keys:
+                    continue
+                cache_val = cache_dict.get(key)
+                if cache_val is None:
+                    continue
+                if not cache_val.can_evict:
+                    continue
+                selected_key = key
                 break
 
-            if not cache_val.can_evict:
-                # Cannot evict. Move to end to check next item.
-                # This changes the order of pinned items, but it's necessary to proceed.
-                cache_dict.move_to_end(key)
-                iterations += 1
-                continue
+            if selected_key is None:
+                # Best-effort: nothing currently evictable.
+                break
 
-            count = self.access_counts.get(key, 0)
-            
+            count = self.access_counts.get(selected_key, 0)
             if count > 0:
-                # Reinsert: Decrement count and move to end
-                self.access_counts[key] = count - 1
-                cache_dict.move_to_end(key)
-                iterations += 1
+                # Reinsertion step: decrement the access count and move to tail.
+                self.access_counts[selected_key] = count - 1
+                cache_dict.move_to_end(selected_key)
             else:
-                # Found a candidate (count == 0)
-                evict_keys.append(key)
-                # Move to end to expose the next item for the next candidate search
-                cache_dict.move_to_end(key)
-                iterations += 1
+                # Candidate found.
+                evict_keys.append(selected_key)
+                # IMPORTANT: many backends evict via `batched_remove(..., force=False)`
+                # which does not call `update_on_force_evict`. Clean up here to avoid
+                # leaking internal state.
+                self.access_counts.pop(selected_key, None)
+
+            iterations += 1
 
         return evict_keys
