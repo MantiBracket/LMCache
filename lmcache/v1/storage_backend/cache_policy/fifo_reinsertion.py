@@ -53,50 +53,43 @@ class FIFOReinsertionCachePolicy(BaseCachePolicy[KeyType, OrderedDict[KeyType, A
     ) -> list[KeyType]:
         evict_keys: list[KeyType] = []
 
-        # Safety limit to prevent infinite loops if all items are pinned.
-        # In the worst case we may need to "cycle" through evictable entries
-        # multiple times until their access counts are decremented to 0.
-        max_iterations = len(cache_dict) * (self.max_access_count + 2)
-        iterations = 0
+        # We allow multiple rounds (bounded by max_access_count) so items with a
+        # positive access counter can age out without unbounded scanning. Each
+        # round is a single pass over cache_dict; reinsertions are applied after
+        # the pass to keep iteration safe.
+        max_rounds = self.max_access_count + 1
+        for _ in range(max_rounds):
+            keys_to_reinsert: list[KeyType] = []
 
-        while len(evict_keys) < num_candidates and cache_dict:
-            if iterations > max_iterations:
-                logger.warning(
-                    "Max iterations reached in get_evict_candidates. Stopping search."
-                )
-                break
-
-            # Find the oldest *evictable* entry (pinned entries are skipped but not
-            # reordered; FIFO order among pinned entries is preserved).
-            selected_key: KeyType | None = None
-            for key in list(cache_dict.keys()):
-                if key in evict_keys:
-                    continue
-                cache_val = cache_dict.get(key)
+            for key, cache_val in cache_dict.items():
                 if cache_val is None:
                     continue
                 if not cache_val.can_evict:
                     continue
-                selected_key = key
-                break
 
-            if selected_key is None:
-                # Best-effort: nothing currently evictable.
-                break
+                count = self.access_counts.get(key, 0)
+                if count > 0:
+                    self.access_counts[key] = count - 1
+                    keys_to_reinsert.append(key)
+                    continue
 
-            count = self.access_counts.get(selected_key, 0)
-            if count > 0:
-                # Reinsertion step: decrement the access count and move to tail.
-                self.access_counts[selected_key] = count - 1
-                cache_dict.move_to_end(selected_key)
-            else:
-                # Candidate found.
-                evict_keys.append(selected_key)
+                evict_keys.append(key)
                 # IMPORTANT: many backends evict via `batched_remove(..., force=False)`
                 # which does not call `update_on_force_evict`. Clean up here to avoid
                 # leaking internal state.
-                self.access_counts.pop(selected_key, None)
+                self.access_counts.pop(key, None)
 
-            iterations += 1
+                if len(evict_keys) == num_candidates:
+                    break
+
+            # Apply reinsertion after iteration to avoid mutating during traversal.
+            for key in keys_to_reinsert:
+                cache_dict.move_to_end(key)
+
+            if len(evict_keys) == num_candidates:
+                break
+            if not keys_to_reinsert:
+                # No progress possible (all pinned or None).
+                break
 
         return evict_keys
