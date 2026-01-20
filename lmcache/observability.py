@@ -69,6 +69,10 @@ class LMCacheStats:
     retrieve_speed: List[float]  # Tokens per second
     store_speed: List[float]  # Tokens per second
 
+    # LMCache load-to-GPU metrics
+    interval_load_time_s: List[float]
+    interval_load_bytes: List[int]
+
     # P2P transfer metrics
     interval_p2p_requests: int
     interval_p2p_transferred_tokens: int
@@ -186,6 +190,10 @@ class LMCStatsMonitor:
         # which includes rpc and schedule time
         self.interval_remote_time_to_get_sync: List[float] = []
 
+        # LMCache load-to-GPU metrics
+        self.interval_load_time_s: List[float] = []
+        self.interval_load_bytes: List[int] = []
+
         self.interval_remote_ping_latency = 0
         self.interval_remote_ping_errors = 0
         self.interval_remote_ping_success = 0
@@ -272,6 +280,9 @@ class LMCStatsMonitor:
         retrieve_stats.local_hit_tokens = retrieved_tokens
         retrieve_stats.end_time = curr_time
         self.interval_hit_tokens += retrieved_tokens
+        duration = retrieve_stats.time_to_retrieve()
+        if duration > 0:
+            self.interval_load_time_s.append(duration)
 
     @thread_safe
     def on_store_request(self, num_tokens: int) -> int:
@@ -397,6 +408,13 @@ class LMCStatsMonitor:
     def update_interval_prompt_tokens(self, delta: int):
         self.interval_prompt_tokens += delta
 
+    @thread_safe
+    def update_interval_load_metrics(self, load_time_s: float, load_bytes: int):
+        if load_time_s <= 0 or load_bytes <= 0:
+            return
+        self.interval_load_time_s.append(load_time_s)
+        self.interval_load_bytes.append(load_bytes)
+
     def _clear(self):
         """
         Clear all the distribution stats
@@ -421,6 +439,9 @@ class LMCStatsMonitor:
         self.interval_remote_time_to_get.clear()
         self.interval_remote_time_to_put.clear()
         self.interval_remote_time_to_get_sync.clear()
+
+        self.interval_load_time_s.clear()
+        self.interval_load_bytes.clear()
 
         self.interval_remote_ping_latency = 0
         self.interval_remote_ping_errors = 0
@@ -563,6 +584,8 @@ class LMCStatsMonitor:
             interval_request_cache_lifespan=request_lifespan,
             interval_prompt_tokens=self.interval_prompt_tokens,
             interval_lookup_0_hit_requests=self.interval_lookup_0_hit_requests,
+            interval_load_time_s=self.interval_load_time_s.copy(),
+            interval_load_bytes=self.interval_load_bytes.copy(),
         )
         self._clear()
         return ret

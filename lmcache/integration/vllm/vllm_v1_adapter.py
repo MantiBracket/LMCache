@@ -1352,6 +1352,36 @@ class LMCacheConnectorV1Impl:
         self._invalid_block_ids.clear()
         return invalid_blocks
 
+    def get_kv_connector_stats(self) -> Optional[dict[str, Any]]:
+        stats = self._stats_monitor.get_stats_and_clear()
+        load_times = getattr(stats, "interval_load_time_s", [])
+
+        if not load_times:
+            return None
+
+        count = len(load_times)
+        total_time_s = float(sum(load_times))
+
+        if self.lmcache_engine is None:
+            return None
+
+        kv_shape = self.lmcache_engine.metadata.kv_shape
+        kv_dtype = self.lmcache_engine.metadata.kv_dtype
+        bytes_per_token = (
+            kv_shape[0]
+            * kv_shape[1]
+            * kv_shape[3]
+            * kv_shape[4]
+            * kv_dtype.itemsize
+        )
+        total_bytes = int(stats.interval_hit_tokens * bytes_per_token)
+
+        return {
+            "lmcache_load_count": count,
+            "lmcache_load_total_time_s": total_time_s,
+            "lmcache_load_total_bytes": total_bytes,
+        }
+
     @_lmcache_nvtx_annotate
     def shutdown(self):
         # Standard
