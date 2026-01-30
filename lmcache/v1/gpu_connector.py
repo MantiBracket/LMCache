@@ -54,6 +54,19 @@ class GPUConnectorInterface(metaclass=abc.ABCMeta):
             token sequence.
         """
         raise NotImplementedError
+    
+    def serialize_from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
+        """
+        Serialize and compress data directly from GPU to CPU to avoid redundant
+        GPU-CPU-GPU transfers.
+
+        :param MemoryObj memory_obj: The memory object to store the data from GPU.
+        :param int start: The starting index of the data in the corresponding
+            token sequence.
+        :param int end: The ending index of the data in the corresponding
+            token sequence.
+        """
+        raise NotImplementedError
 
     @abc.abstractmethod
     def batched_from_gpu(
@@ -76,8 +89,7 @@ class GPUConnectorInterface(metaclass=abc.ABCMeta):
         """
         raise NotImplementedError
 
-    @abc.abstractmethod
-    def batched_to_gpu(
+    def batched_serialize_from_gpu(
         self,
         memory_objs: Union[List[List[MemoryObj]], List[MemoryObj]],
         starts: List[int],
@@ -308,6 +320,68 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
+    @_lmcache_nvtx_annotate
+    def serialize_from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
+        """
+        Serialize and compress data directly from GPU to CPU to avoid redundant
+        GPU-CPU-GPU transfers.
+
+        :param MemoryObj memory_obj: The memory object to store the data from GPU.
+        :param int start: The starting index of the data in the corresponding token sequence.
+        :param int end: The ending index of the data in the corresponding token sequence.
+        :raises ValueError: If 'kvcaches' or 'slot_mapping' is not provided in kwargs.
+        """
+        assert memory_obj.tensor is not None, "Memory object tensor is None."
+
+        self.initialize_kvcaches_ptr(**kwargs)
+        assert self.kvcaches is not None, (
+            "kvcaches should be provided in kwargs or initialized beforehand."
+        )
+
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs.")
+
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+
+        kv_cache_pointers = self._initialize_pointers(self.kvcaches)
+
+        # Create a temporary GPU buffer for decompression
+        if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
+            self.gpu_buffer = torch.empty(
+                self.get_shape(end - start),
+                dtype=memory_obj.tensor.dtype,
+                device=self.kvcaches[0].device,
+            )
+
+        # Perform decompression directly on GPU
+        with torch.cuda.stream(self.store_stream):
+            lmc_ops.multi_layer_kv_transfer(
+                self.gpu_buffer,
+                kv_cache_pointers,
+                slot_mapping[start:end],
+                self.kvcaches[0].device,
+                self.page_buffer_size,
+                True,  # Direction: GPU -> GPU buffer
+                self.use_mla,
+            )
+
+            # Serialize the data on GPU (simulate decompression)
+            if self.serializer:
+                serialized_tensor = self.serializer.serialize(self.gpu_buffer)
+            else:
+                raise ValueError("Serializer is not initialized.")
+
+            # Transfer serialized data to CPU
+            memory_obj.tensor = serialized_tensor.cpu()
+
+        # Update memory object metadata
+        if self.use_mla:
+            memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
+        else:
+            memory_obj.metadata.fmt = MemoryFormat.KV_2LTD
+
+        return memory_obj
+
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
         with torch.cuda.stream(self.load_stream):
@@ -319,6 +393,10 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
     def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
         for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
             self.from_gpu(memory_obj, start, end, **kwargs)
+
+    def batched_serialize_from_gpu(self, memory_objs, starts, ends, **kwargs):
+        for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
+            self.serialize_from_gpu(memory_obj, start, end, **kwargs)
 
     def get_shape(self, num_tokens: int) -> torch.Size:
         kv_size = 1 if self.use_mla else 2

@@ -337,16 +337,17 @@ class LMCacheEngine:
         # memory_objs might be empty, directly return to avoid sending tokens
         if not memory_objs:
             return
-
-        # 目前对于压缩卸载的实现，仍然是先从 GPU 拷贝到 CPU，再考虑压缩(还会回到 GPU 上执行量化压缩，效率很低)
-        # TODO(wk): 对于需要压缩保存的 block，直接在 GPU 端压缩后卸载存储到 CPU，避免多一次拷贝
-        self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
+        
+        compress = kwargs.get("compress", False)
+        if compress:
+            self.gpu_connector.batched_serialize_from_gpu(memory_objs, starts, ends, **kwargs)
+        else:
+            self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
         offload_time += time.perf_counter() - t
 
         t = time.perf_counter()
 
         transfer_spec = kwargs.get("transfer_spec", None)
-        compress = kwargs.get("compress", False)
 
         self.storage_manager.batched_put(keys, memory_objs, transfer_spec=transfer_spec, compress=compress)
         put_time += time.perf_counter() - t
