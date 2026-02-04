@@ -273,16 +273,19 @@ class LMCStatsMonitor:
         return self.retrieve_request_id - 1
 
     @thread_safe
-    def on_retrieve_finished(self, request_id: int, retrieved_tokens: int):
+    def on_retrieve_finished(self, request_id: int, retrieved_tokens: int, load_time_s: Optional[float] = None):
         curr_time = time.time()
         assert request_id in self.retrieve_requests
         retrieve_stats = self.retrieve_requests[request_id]
         retrieve_stats.local_hit_tokens = retrieved_tokens
         retrieve_stats.end_time = curr_time
         self.interval_hit_tokens += retrieved_tokens
-        duration = retrieve_stats.time_to_retrieve()
-        if duration > 0:
-            self.interval_load_time_s.append(duration)
+        if load_time_s is not None:
+            self.interval_load_time_s.append(load_time_s)
+        else:
+            duration = retrieve_stats.time_to_retrieve()
+            if duration > 0:
+                self.interval_load_time_s.append(duration)
 
     @thread_safe
     def on_store_request(self, num_tokens: int) -> int:

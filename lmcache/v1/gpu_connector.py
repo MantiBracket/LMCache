@@ -500,6 +500,9 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
             old_positions_full = torch.zeros(
                 (num_all_tokens,), dtype=torch.int64, device=self.kvcaches[0].device
             )
+        load_time = kwargs.get("load_time")
+        if load_time is not None and "value" not in load_time:
+            load_time["value"] = 0.0
         for layer_id in range(self.num_layers + 2):
             if layer_id > 1:
                 lmc_ops.single_layer_kv_transfer(
@@ -544,8 +547,13 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
             if layer_id < self.num_layers:
                 memory_objs_layer = yield
 
-                # memobj -> gpu_buffer
+                start_event = end_event = None
+                # memobj -> gpu_buffer (H2D)
                 with torch.cuda.stream(self.load_stream):
+                    if load_time is not None:
+                        start_event = torch.cuda.Event(enable_timing=True)
+                        end_event = torch.cuda.Event(enable_timing=True)
+                        start_event.record()
                     for start, end, memory_obj in zip(
                         starts, ends, memory_objs_layer, strict=False
                     ):
@@ -563,6 +571,13 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                             old_positions_full[
                                 start - buf_offset : end - buf_offset
                             ] = memory_obj.metadata.cached_positions
+
+                    if load_time is not None:
+                        end_event.record()
+
+                if load_time is not None:
+                    end_event.synchronize()
+                    load_time["value"] += start_event.elapsed_time(end_event) / 1000.0
 
             elif layer_id == self.num_layers:
                 yield
@@ -830,6 +845,10 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         sync: bool = kwargs["sync"]
 
+        load_time = kwargs.get("load_time")
+        if load_time is not None and "value" not in load_time:
+            load_time["value"] = 0.0
+
         self._lazy_initialize_buffer(self.kvcaches)
 
         slot_mapping_chunks = []
@@ -866,6 +885,11 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
             # memobj -> gpu_buffer -> kvcaches
             with torch.cuda.stream(self.load_stream):
+                start_event = end_event = None
+                if load_time is not None and self.use_gpu:
+                    start_event = torch.cuda.Event(enable_timing=True)
+                    end_event = torch.cuda.Event(enable_timing=True)
+                    start_event.record()
                 for start, end, memory_obj in zip(
                     starts, ends, memory_objs_layer, strict=False
                 ):
@@ -895,6 +919,9 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                             self.use_mla,
                         )
 
+                if load_time is not None and self.use_gpu:
+                    end_event.record()
+
                 if self.use_gpu:
                     lmc_ops.single_layer_kv_transfer(
                         tmp_gpu_buffer_obj.tensor,
@@ -905,6 +932,10 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         self.vllm_two_major,
                         self.use_mla,
                     )
+
+                if load_time is not None and self.use_gpu:
+                    end_event.synchronize()
+                    load_time["value"] += start_event.elapsed_time(end_event) / 1000.0
         yield
 
         # synchronize the last layer
@@ -1343,6 +1374,10 @@ class SGLangLayerwiseGPUConnector(GPUConnectorInterface):
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
 
+        load_time = kwargs.get("load_time")
+        if load_time is not None and "value" not in load_time:
+            load_time["value"] = 0.0
+
         self._lazy_initialize_buffer(self.kvcaches)
 
         slot_mapping_chunks = []
@@ -1375,6 +1410,11 @@ class SGLangLayerwiseGPUConnector(GPUConnectorInterface):
                 logger.debug(f"Finished loading layer {layer_id - 1}")
 
             # memobj -> gpu_buffer -> kvcaches
+            start_event = end_event = None
+            if load_time is not None and self.use_gpu:
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                start_event.record(torch.cuda.current_stream())
             for start, end, memory_obj in zip(
                 starts, ends, memory_objs_layer, strict=False
             ):
@@ -1404,6 +1444,11 @@ class SGLangLayerwiseGPUConnector(GPUConnectorInterface):
                     False,
                     True,
                 )
+
+            if load_time is not None and self.use_gpu:
+                end_event.record(torch.cuda.current_stream())
+                end_event.synchronize()
+                load_time["value"] += start_event.elapsed_time(end_event) / 1000.0
 
         # free the buffer memory
         if self.use_gpu:
