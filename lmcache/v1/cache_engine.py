@@ -701,6 +701,10 @@ class LMCacheEngine:
 
             ret_mask[start:end] = True
 
+        # 统计 layerwise load time
+        load_time = {}
+        kwargs["load_time"] = load_time
+
         if keys:
             # Transpose the keys into layer major format
             keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
@@ -752,7 +756,7 @@ class LMCacheEngine:
         next(mem_obj_consumer)
 
         retrieved_tokens = torch.sum(ret_mask)
-        self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
+        self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens, load_time.get("value", None))
         logger.info(
             f"Retrieved {retrieved_tokens} "
             f"out of {num_required_tokens} "
