@@ -15,7 +15,7 @@ import asyncio
 import gc
 import multiprocessing
 import time
-
+import threading
 # Third Party
 import torch
 
@@ -211,7 +211,12 @@ class LMCacheEngine:
         self.force_store_wait = config.extra_config and config.extra_config.get(
             "force_store_wait", False
         )
-
+        
+        # Compression statistics counters
+        self.compressed_stored_count = 0
+        self.decompressed_retrieved_count = 0
+        self.compression_stats_lock = threading.Lock()
+ 
         gc.collect()
         if not config.py_enable_gc:
             gc.disable()
@@ -341,6 +346,10 @@ class LMCacheEngine:
         compress = kwargs.get("compress", False)
         if compress:
             self.gpu_connector.batched_serialize_from_gpu(memory_objs, starts, ends, **kwargs)
+            # Update compression statistics
+            with self.compression_stats_lock:
+                self.compressed_stored_count += len(memory_objs)
+            logger.info(f"Compressed {len(memory_objs)} KV caches during store operation")
         else:
             self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
         offload_time += time.perf_counter() - t
@@ -568,6 +577,20 @@ class LMCacheEngine:
         # RDMA is another example.
         if len(reordered_chunks) > 0:
             _, memory_objs, starts, ends = zip(*reordered_chunks, strict=False)
+            
+            # Count how many memory objects were decompressed during retrieval
+            decompressed_count = 0
+            for memory_obj in memory_objs:
+                # Check if the memory object was compressed (likely a BytesBufferMemoryObj)
+                from lmcache.v1.memory_management import BytesBufferMemoryObj
+                if isinstance(memory_obj, BytesBufferMemoryObj):
+                    decompressed_count += 1
+            
+            if decompressed_count > 0:
+                with self.compression_stats_lock:
+                    self.decompressed_retrieved_count += decompressed_count
+                logger.info(f"Decompressed {decompressed_count} KV caches during retrieve operation")
+
             self.gpu_connector.batched_to_gpu(
                 list(memory_objs), list(starts), list(ends), **kwargs
             )
@@ -1132,7 +1155,29 @@ class LMCacheEngine:
             else:
                 return 0
         return self._clear(tokens, locations, request_configs)
-
+    def get_compression_stats(self):
+        """
+        Get compression statistics.
+        
+        Returns:
+            dict: Dictionary containing compression statistics including:
+                - compressed_stored_count: Number of KV caches compressed during store operations
+                - decompressed_retrieved_count: Number of KV caches decompressed during retrieve operations
+        """
+        with self.compression_stats_lock:
+            stats = {
+                "compressed_stored_count": self.compressed_stored_count,
+                "decompressed_retrieved_count": self.decompressed_retrieved_count,
+            }
+        return stats
+ 
+    def reset_compression_stats(self):
+        """
+        Reset compression statistics counters to zero.
+        """
+        with self.compression_stats_lock:
+            self.compressed_stored_count = 0
+            self.decompressed_retrieved_count = 0
     def _clear(
         self,
         tokens: Optional[Union[torch.Tensor, List[int]]] = None,
