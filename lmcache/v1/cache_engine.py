@@ -51,6 +51,8 @@ from lmcache.v1.token_database import (
     SegmentTokenDatabase,
     TokenDatabase,
 )
+from lmcache.v1.storage_backend.naive_serde.cachegen_encoder import CacheGenSerializer
+from lmcache.v1.storage_backend.naive_serde.cachegen_decoder import CacheGenDeserializer
 
 logger = init_logger(__name__)
 
@@ -177,7 +179,13 @@ class LMCacheEngine:
                 event_manager=self.event_manager,
                 lmcache_worker=self.lmcache_worker,
             )
-
+        
+        self.serializer = None
+        self.deserializer = None
+        if metadata:
+             self.serializer = CacheGenSerializer(config, metadata)
+             self.deserializer = CacheGenDeserializer(config, metadata)
+        
         # HACK: remove this in the future
         # NOTE (Jiayi): This is currently used to support
         # dropping the kv cache from the buffer in PD backend
@@ -345,7 +353,7 @@ class LMCacheEngine:
         
         compress = kwargs.get("compress", False)
         if compress:
-            self.gpu_connector.batched_serialize_from_gpu(memory_objs, starts, ends, **kwargs)
+            self.gpu_connector.batched_serialize_from_gpu(memory_objs, starts, ends, self.serializer, **kwargs)
             # Update compression statistics
             with self.compression_stats_lock:
                 self.compressed_stored_count += len(memory_objs)

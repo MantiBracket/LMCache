@@ -12,7 +12,8 @@ from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.compute.blend.utils import LMCBlenderBuilder
 from lmcache.v1.memory_management import GPUMemoryAllocator  # noqa: E501
-from lmcache.v1.memory_management import MemoryFormat, MemoryObj
+from lmcache.v1.memory_management import MemoryFormat, MemoryObj, TensorMemoryObj
+from lmcache.v1.storage_backend.naive_serde.serde import Serializer
 
 if torch.cuda.is_available():
     # First Party
@@ -55,7 +56,7 @@ class GPUConnectorInterface(metaclass=abc.ABCMeta):
         """
         raise NotImplementedError
     
-    def serialize_from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
+    def serialize_from_gpu(self, memory_obj: MemoryObj, start: int, end: int, serializer: Serializer = None, **kwargs):
         """
         Serialize and compress data directly from GPU to CPU to avoid redundant
         GPU-CPU-GPU transfers.
@@ -94,6 +95,7 @@ class GPUConnectorInterface(metaclass=abc.ABCMeta):
         memory_objs: Union[List[List[MemoryObj]], List[MemoryObj]],
         starts: List[int],
         ends: List[int],
+        serializer: Serializer = None,
         **kwargs,
     ):
         """
@@ -321,7 +323,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
     @_lmcache_nvtx_annotate
-    def serialize_from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
+    def serialize_from_gpu(self, memory_obj: MemoryObj, start: int, end: int, serializer: Serializer = None, **kwargs):
         """
         Serialize and compress data directly from GPU to CPU to avoid redundant
         GPU-CPU-GPU transfers.
@@ -345,7 +347,6 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
         kv_cache_pointers = self._initialize_pointers(self.kvcaches)
 
-        # Create a temporary GPU buffer for decompression
         if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
             self.gpu_buffer = torch.empty(
                 self.get_shape(end - start),
@@ -353,7 +354,6 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                 device=self.kvcaches[0].device,
             )
 
-        # Perform decompression directly on GPU
         with torch.cuda.stream(self.store_stream):
             lmc_ops.multi_layer_kv_transfer(
                 self.gpu_buffer,
@@ -361,20 +361,23 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                 slot_mapping[start:end],
                 self.kvcaches[0].device,
                 self.page_buffer_size,
-                True,  # Direction: GPU -> GPU buffer
+                True,
                 self.use_mla,
             )
 
-            # Serialize the data on GPU (simulate decompression)
-            if self.serializer:
-                serialized_tensor = self.serializer.serialize(self.gpu_buffer)
+            # Serialize the data on GPU (avoiding GPU->CPU->GPU round trip)
+            if serializer:
+                temp_memory_obj = TensorMemoryObj(
+                    raw_data=self.gpu_buffer,
+                    metadata=memory_obj.metadata,
+                    parent_allocator=None
+                )
+                serialized_data = serializer.serialize(temp_memory_obj)
+                if serialized_data.tensor is not None:
+                    memory_obj.tensor.copy_(serialized_data.tensor, non_blocking=True)
             else:
                 raise ValueError("Serializer is not initialized.")
 
-            # Transfer serialized data to CPU
-            memory_obj.tensor = serialized_tensor.cpu()
-
-        # Update memory object metadata
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
         else:
@@ -394,9 +397,9 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
             self.from_gpu(memory_obj, start, end, **kwargs)
 
-    def batched_serialize_from_gpu(self, memory_objs, starts, ends, **kwargs):
+    def batched_serialize_from_gpu(self, memory_objs, starts, ends, serializer: Serializer = None, **kwargs):
         for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
-            self.serialize_from_gpu(memory_obj, start, end, **kwargs)
+            self.serialize_from_gpu(memory_obj, start, end, serializer=serializer, **kwargs)
 
     def get_shape(self, num_tokens: int) -> torch.Size:
         kv_size = 1 if self.use_mla else 2
