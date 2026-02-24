@@ -313,6 +313,7 @@ class LMCacheEngine:
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
 
+        compress = kwargs.get("compress", False)
         for start, end, key in self.token_database.process_tokens(
             tokens,
             hashes,
@@ -323,42 +324,41 @@ class LMCacheEngine:
             assert isinstance(key, CacheEngineKey)
             # Allocate the memory object
             num_tokens = end - start
-            kv_shape = self.gpu_connector.get_shape(num_tokens)
-            kv_dtype = self.metadata.kv_dtype
 
             # TODO (Jiayi): should be batched in the future
-            memory_obj = self.storage_manager.allocate(
-                kv_shape,
-                kv_dtype,
-                busy_loop=self.force_store_wait,
-                fmt=self.fmt,
-            )
-            if memory_obj is None:
-                logger.warning(
-                    "Local cpu memory under pressure so"
-                    " choosing to not store the KV cache."
+            if not compress:
+                kv_shape = self.gpu_connector.get_shape(num_tokens)
+                kv_dtype = self.metadata.kv_dtype
+                memory_obj = self.storage_manager.allocate(
+                    kv_shape,
+                    kv_dtype,
+                    busy_loop=self.force_store_wait,
+                    fmt=self.fmt,
                 )
-                break
+                if memory_obj is None:
+                    logger.warning(
+                        "Local cpu memory under pressure so"
+                        " choosing to not store the KV cache."
+                    )
+                    break
+                memory_objs.append(memory_obj)
+                tot_kv_size += memory_obj.get_size()
 
             starts.append(start)
             ends.append(end)
             keys.append(key)
-            memory_objs.append(memory_obj)
-            tot_kv_size += memory_obj.get_size()
             tot_token_num += num_tokens
 
-        # memory_objs might be empty, directly return to avoid sending tokens
-        if not memory_objs:
-            return
-        
-        compress = kwargs.get("compress", False)
         if compress:
-            self.gpu_connector.batched_serialize_from_gpu(memory_objs, starts, ends, self.serializer, **kwargs)
+            memory_objs = self.gpu_connector.batched_serialize_from_gpu(starts, ends, self.serializer, self.metadata.kv_dtype, **kwargs)
             # Update compression statistics
             with self.compression_stats_lock:
                 self.compressed_stored_count += len(memory_objs)
             logger.info(f"Compressed {len(memory_objs)} KV caches during store operation")
         else:
+            # memory_objs might be empty, directly return to avoid sending tokens
+            if not memory_objs:
+                return
             self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
         offload_time += time.perf_counter() - t
 
