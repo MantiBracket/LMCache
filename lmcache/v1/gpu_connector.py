@@ -341,10 +341,6 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
             raise ValueError("'slot_mapping' should be provided in kwargs.")
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
-        
-        logger.info(f"start: {start}, end: {end}, slot_mapping size: {slot_mapping.size()}")
-        assert 0 <= start < len(slot_mapping), "start index out of range"
-        assert 0 < end <= len(slot_mapping), "end index out of range"
 
         kv_cache_pointers = self._initialize_pointers(self.kvcaches)
 
@@ -354,16 +350,10 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                 dtype=dtype if dtype is not None else self.kvcaches[0].dtype,
                 device=self.kvcaches[0].device,
             )
-        slot_slice = slot_mapping[start:end]
-        if (slot_slice < -1).any() or (slot_slice >= self.kvcaches[0].size(2)).any():
-            logger.error(f"Invalid slot_mapping indices in range [{start}:{end}]: "
-                        f"min={slot_slice.min()}, max={slot_slice.max()}, "
-                        f"kvcache size={self.kvcaches[0].size(2)}")
-        self.gpu_buffer.zero_()
+
         with torch.cuda.stream(self.store_stream):
             assert self.gpu_buffer.device == self.kvcaches[0].device
             tmp_gpu_buffer = self.gpu_buffer[:, :, : end - start, :]
-            self.store_stream.synchronize()
             lmc_ops.multi_layer_kv_transfer(
                 tmp_gpu_buffer,
                 kv_cache_pointers,
@@ -373,13 +363,12 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                 True,
                 self.use_mla,
             )
-            self.store_stream.synchronize()
 
-            # Serialize the data on GPU (avoiding GPU->CPU->GPU round trip)
-            if serializer:
-                memory_obj = serializer.serialize_tensor(tmp_gpu_buffer)
-            else:
-                raise ValueError("Serializer is not initialized.")
+        # Serialize the data on GPU (avoiding GPU->CPU->GPU round trip)
+        if serializer:
+            memory_obj = serializer.serialize_tensor(tmp_gpu_buffer)
+        else:
+            raise ValueError("Serializer is not initialized.")
 
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
